@@ -103,15 +103,20 @@ Chrome DevTools → Sources → 可以看到 Rust 源文件并设置断点。需
 
 ```
 webgpu_demo/
-├── Cargo.toml            # Rust 依赖配置
-├── build.sh              # 构建脚本
+├── Cargo.toml              # Rust 依赖配置
+├── build.sh                # 构建脚本
 ├── src/
-│   ├── lib.rs            # 主逻辑: 初始化 WebGPU、创建 pipeline、动画循环
-│   ├── compute.wgsl      # Compute shader: GPU 并行生成分形图像
-│   └── render.wgsl       # Render shader: 全屏纹理采样 blit
+│   ├── lib.rs              # WASM 入口、模块声明、浏览器事件集成
+│   ├── gpu.rs              # WebGPU 设备初始化 (Instance → Adapter → Device)
+│   ├── params.rs           # Uniform 参数结构定义 (时间、分辨率)
+│   ├── pipeline.rs         # Compute/Render Pipeline 创建和配置
+│   ├── texture.rs          # 纹理、Bind Group、Sampler 管理
+│   ├── state.rs            # 应用状态: 组装上述模块，resize/render 逻辑
+│   ├── compute.wgsl        # Compute shader: GPU 并行生成分形图像
+│   └── render.wgsl         # Render shader: 全屏纹理采样 blit
 └── web/
-    ├── index.html         # 入口 HTML
-    └── pkg/               # wasm-pack 构建输出 (git ignored)
+    ├── index.html           # 入口 HTML
+    └── pkg/                 # wasm-pack 构建输出 (git ignored)
 ```
 
 ## 架构

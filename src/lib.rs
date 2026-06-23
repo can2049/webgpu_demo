@@ -1,418 +1,55 @@
-use wgpu::util::DeviceExt;
+//! # WebGPU Demo — Rust + WASM
+//!
+//! 一个使用 Rust 编写、编译为 WebAssembly 运行在浏览器中的 WebGPU 渲染演示。
+//!
+//! ## 模块结构
+//!
+//! ```text
+//! lib.rs          ← WASM 入口和动画循环（本文件）
+//! ├── gpu.rs      ← WebGPU 设备初始化
+//! ├── params.rs   ← Uniform 参数定义
+//! ├── pipeline.rs ← Compute/Render 管线创建
+//! ├── texture.rs  ← 纹理和 bind group 管理
+//! └── state.rs    ← 应用状态（组装上述模块）
+//! ```
+//!
+//! ## 渲染架构
+//!
+//! 每帧执行两个 GPU pass:
+//! 1. **Compute Pass** — 运行 `compute.wgsl`，在 GPU 上并行计算每个像素的颜色
+//! 2. **Render Pass** — 运行 `render.wgsl`，将计算结果绘制到屏幕
+
+mod gpu;
+mod params;
+mod pipeline;
+mod state;
+mod texture;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    time: f32,
-    width: f32,
-    height: f32,
-    _padding: f32,
-}
+// ─────────────────────────────────────────────
+//  WASM 入口和浏览器事件集成
+// ─────────────────────────────────────────────
 
-struct State {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
-    compute_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline,
-    params_buffer: wgpu::Buffer,
-    compute_bind_group_layout: wgpu::BindGroupLayout,
-    render_bind_group_layout: wgpu::BindGroupLayout,
-    #[allow(dead_code)]
-    storage_texture: wgpu::Texture,
-    compute_bind_group: wgpu::BindGroup,
-    render_bind_group: wgpu::BindGroup,
-    sampler: wgpu::Sampler,
-    width: u32,
-    height: u32,
-}
-
-impl State {
-    async fn new(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
-            flags: Default::default(),
-            memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
-            display: None,
-        });
-
-        let surface_target = wgpu::SurfaceTarget::Canvas(canvas);
-        let surface = instance
-            .create_surface(surface_target)
-            .expect("Failed to create surface");
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("Failed to find adapter");
-
-        log::info!("Adapter: {:?}", adapter.get_info());
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
-                ..Default::default()
-            })
-            .await
-            .expect("Failed to create device");
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &surface_config);
-
-        let compute_shader = device.create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
-        let render_shader = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
-
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Params Buffer"),
-            contents: bytemuck::cast_slice(&[Params {
-                time: 0.0,
-                width: width as f32,
-                height: height as f32,
-                _padding: 0.0,
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Compute BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[Some(&compute_bind_group_layout)],
-                immediate_size: 0,
-            });
-
-        let compute_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Compute Pipeline"),
-                layout: Some(&compute_pipeline_layout),
-                module: &compute_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let render_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Render BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[Some(&render_bind_group_layout)],
-                immediate_size: 0,
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Texture Sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let (storage_texture, compute_bind_group, render_bind_group) =
-            Self::create_texture_and_bind_groups(
-                &device,
-                &params_buffer,
-                &sampler,
-                &compute_bind_group_layout,
-                &render_bind_group_layout,
-                width,
-                height,
-            );
-
-        Self {
-            device,
-            queue,
-            surface,
-            surface_config,
-            compute_pipeline,
-            render_pipeline,
-            params_buffer,
-            compute_bind_group_layout,
-            render_bind_group_layout,
-            storage_texture,
-            compute_bind_group,
-            render_bind_group,
-            sampler,
-            width,
-            height,
-        }
-    }
-
-    fn create_texture_and_bind_groups(
-        device: &wgpu::Device,
-        params_buffer: &wgpu::Buffer,
-        sampler: &wgpu::Sampler,
-        compute_bgl: &wgpu::BindGroupLayout,
-        render_bgl: &wgpu::BindGroupLayout,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::BindGroup, wgpu::BindGroup) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Storage Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: compute_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-            ],
-        });
-
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Render Bind Group"),
-            layout: render_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        });
-
-        (texture, compute_bind_group, render_bind_group)
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.width = width;
-        self.height = height;
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
-
-        let (texture, compute_bg, render_bg) = Self::create_texture_and_bind_groups(
-            &self.device,
-            &self.params_buffer,
-            &self.sampler,
-            &self.compute_bind_group_layout,
-            &self.render_bind_group_layout,
-            width,
-            height,
-        );
-        self.storage_texture = texture;
-        self.compute_bind_group = compute_bg;
-        self.render_bind_group = render_bg;
-    }
-
-    fn render(&self, time: f32) {
-        self.queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[Params {
-                time,
-                width: self.width as f32,
-                height: self.height as f32,
-                _padding: 0.0,
-            }]),
-        );
-
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(tex)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                log::warn!("Surface texture unavailable, skipping frame");
-                return;
-            }
-        };
-
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Command Encoder"),
-            });
-
-        // --- Compute pass: generate image via GPU compute shader ---
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let wg_x = (self.width + 15) / 16;
-            let wg_y = (self.height + 15) / 16;
-            compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
-        }
-
-        // --- Render pass: blit compute output texture to screen surface ---
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.render_bind_group, &[]);
-            render_pass.draw(0..4, 0..1);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
-    }
-}
-
-// --- WASM entry point ---
-
+/// WASM 模块的入口函数，浏览器加载 WASM 后自动调用。
+///
+/// 完成以下工作:
+/// 1. 设置 panic hook（让 Rust panic 信息显示在浏览器控制台）
+/// 2. 初始化日志系统
+/// 3. 获取 HTML Canvas 元素
+/// 4. 创建渲染状态（初始化 WebGPU）
+/// 5. 注册 window resize 事件监听
+/// 6. 启动 `requestAnimationFrame` 动画循环
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub async fn start() {
+    // console_error_panic_hook 将 Rust panic 转发到浏览器控制台，
+    // 默认情况下 WASM 中的 panic 只会显示 "unreachable" 错误。
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     console_log::init_with_level(log::Level::Info).expect("Failed to init logger");
 
+    // 从 DOM 获取 canvas 元素，所有 WebGPU 渲染都输出到这个 canvas
     let window = web_sys::window().expect("No window");
     let document = window.document().expect("No document");
     let canvas = document
@@ -421,49 +58,77 @@ pub async fn start() {
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .expect("Element is not a canvas");
 
+    // 设置 canvas 像素尺寸与 CSS 布局尺寸一致，避免模糊
     let width = canvas.client_width() as u32;
     let height = canvas.client_height() as u32;
     canvas.set_width(width);
     canvas.set_height(height);
 
-    let state = State::new(canvas.clone(), width, height).await;
+    let state = state::State::new(canvas.clone(), width, height).await;
+
+    // 使用 Rc<RefCell<>> 共享 state，因为多个 JS 回调（resize、animation）都需要访问它。
+    // WASM 是单线程的，所以 Rc 就够了，不需要 Arc。
     let state = std::rc::Rc::new(std::cell::RefCell::new(state));
 
-    {
-        let state = state.clone();
-        let canvas = canvas.clone();
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            let w = canvas.client_width() as u32;
-            let h = canvas.client_height() as u32;
-            if w > 0 && h > 0 {
-                canvas.set_width(w);
-                canvas.set_height(h);
-                state.borrow_mut().resize(w, h);
-            }
-        });
-        window
-            .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())
-            .expect("Failed to add resize listener");
-        closure.forget();
-    }
-
-    // requestAnimationFrame loop
-    {
-        let f: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn FnMut(f64)>>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let g = f.clone();
-        let state = state.clone();
-
-        *g.borrow_mut() = Some(Closure::new(move |timestamp: f64| {
-            let time_sec = (timestamp / 1000.0) as f32;
-            state.borrow().render(time_sec);
-            request_animation_frame(f.borrow().as_ref().unwrap());
-        }));
-
-        request_animation_frame(g.borrow().as_ref().unwrap());
-    }
+    setup_resize_handler(&window, &canvas, &state);
+    start_animation_loop(&state);
 }
 
+/// 注册浏览器窗口 resize 事件监听器。
+///
+/// 当用户调整浏览器窗口大小时，同步更新 canvas 像素尺寸并重建 GPU 资源。
+/// `closure.forget()` 让闭包的生命周期跟随整个页面，不会被 Rust 的 drop 回收。
+#[cfg(target_arch = "wasm32")]
+fn setup_resize_handler(
+    window: &web_sys::Window,
+    canvas: &web_sys::HtmlCanvasElement,
+    state: &std::rc::Rc<std::cell::RefCell<state::State>>,
+) {
+    let state = state.clone();
+    let canvas = canvas.clone();
+    let closure = Closure::<dyn FnMut()>::new(move || {
+        let w = canvas.client_width() as u32;
+        let h = canvas.client_height() as u32;
+        if w > 0 && h > 0 {
+            canvas.set_width(w);
+            canvas.set_height(h);
+            state.borrow_mut().resize(w, h);
+        }
+    });
+    window
+        .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())
+        .expect("Failed to add resize listener");
+    closure.forget();
+}
+
+/// 启动 `requestAnimationFrame` 驱动的渲染循环。
+///
+/// 浏览器每帧（通常 60fps）回调一次，传入高精度时间戳。
+///
+/// ## 实现细节
+///
+/// 使用 `Rc<RefCell<Option<Closure>>>` 模式让闭包可以递归地注册下一帧回调。
+/// 这是 Rust WASM 中实现 requestAnimationFrame 循环的标准做法，
+/// 因为闭包需要引用自身来注册下一帧。
+#[cfg(target_arch = "wasm32")]
+fn start_animation_loop(state: &std::rc::Rc<std::cell::RefCell<state::State>>) {
+    let f: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn FnMut(f64)>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let g = f.clone();
+    let state = state.clone();
+
+    // `f` 持有闭包本身，闭包内部通过 `f` 引用自己来注册下一帧
+    *g.borrow_mut() = Some(Closure::new(move |timestamp: f64| {
+        let time_sec = (timestamp / 1000.0) as f32;
+        state.borrow().render(time_sec);
+        request_animation_frame(f.borrow().as_ref().unwrap());
+    }));
+
+    // 触发第一帧
+    request_animation_frame(g.borrow().as_ref().unwrap());
+}
+
+/// 调用浏览器的 `window.requestAnimationFrame()` API。
 #[cfg(target_arch = "wasm32")]
 fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
     web_sys::window()
