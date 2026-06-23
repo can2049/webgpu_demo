@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Demo — Rust + WASM</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            color: #eee;
+        }
+        #header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 12px 20px;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(8px);
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        #header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+        #header .tag {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: #2563eb;
+        }
+        #error-banner {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 32px;
+            border-radius: 12px;
+            background: rgba(30,30,30,0.95);
+            border: 1px solid #333;
+            text-align: center;
+            max-width: 500px;
+            z-index: 20;
+        }
+        #error-banner h2 { color: #f87171; margin-bottom: 12px; }
+        #error-banner p { color: #aaa; line-height: 1.6; font-size: 14px; }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>WebGPU Compute + Render Demo</h1>
+        <span class="tag">Rust</span>
+        <span class="tag">WASM</span>
+        <span class="tag">WebGPU</span>
+    </div>
+    <div id="error-banner">
+        <h2>WebGPU Not Available</h2>
+        <p>
+            Your browser does not support WebGPU.<br>
+            Please use a recent version of Chrome (113+), Edge (113+), or Firefox Nightly with WebGPU enabled.
+        </p>
+    </div>
+    <canvas id="webgpu-canvas"></canvas>
+    <script type="module">
+        function showError(title, detail) {
+            const banner = document.getElementById('error-banner');
+            banner.style.display = 'block';
+            banner.querySelector('h2').textContent = title;
+            banner.querySelector('p').innerHTML = detail;
+            document.getElementById('webgpu-canvas').style.display = 'none';
+        }
+
+        async function main() {
+            if (!window.isSecureContext) {
+                showError('Insecure Context',
+                    `WebGPU requires a <b>secure context</b>.<br><br>` +
+                    `Current URL: <code>${location.href}</code><br><br>` +
+                    `Please access via <code>http://localhost:8080</code> instead of IP address.`);
+                return;
+            }
+
+            if (!navigator.gpu) {
+                showError('WebGPU Not Available',
+                    `<code>navigator.gpu</code> is undefined.<br>` +
+                    `Please use Chrome 113+, Edge 113+, or Firefox Nightly.`);
+                return;
+            }
+
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                showError('No GPU Adapter',
+                    `WebGPU is available but no adapter was returned.<br>` +
+                    `Check <code>chrome://gpu</code> for driver issues.`);
+                return;
+            }
+            console.log('WebGPU adapter:', adapter.info);
+
+            const wasm = await import('./pkg/webgpu_demo.js');
+            await wasm.default();
+        }
+
+        main().catch(e => {
+            console.error('WASM init failed:', e);
+            showError('Initialization Failed',
+                `WASM module error: <code>${e.message}</code><br><br>` +
+                `Check DevTools Console (F12) for details.`);
+        });
+    </script>
+</body>
+</html>
