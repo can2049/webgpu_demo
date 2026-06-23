@@ -139,16 +139,25 @@ impl State {
     ///
     /// ```text
     /// 1. 更新 uniform buffer    ──  将当前时间和分辨率写入 GPU
-    /// 2. 获取 surface texture   ──  从交换链获取一帧的输出目标
-    /// 3. 录制命令:
-    ///    a. Compute Pass        ──  GPU 并行计算每像素颜色 → storage texture
-    ///    b. Render Pass         ──  全屏四边形采样 storage texture → surface
-    /// 4. 提交命令到 GPU 队列
+    /// 2. Compute Pass           ──  GPU 并行计算每像素颜色 → storage texture
+    ///    (独立 encoder + submit，确保 compute 写入完成)
+    /// 3. 获取 surface texture   ──  从交换链获取一帧的输出目标
+    /// 4. Render Pass            ──  全屏四边形采样 storage texture → surface
+    ///    (独立 encoder + submit)
     /// 5. 呈现到屏幕
     /// ```
     ///
-    /// GPU 命令是"录制后提交"模式: 先用 CommandEncoder 录制所有命令，
-    /// 最后一次性通过 `queue.submit()` 提交。这比逐条执行效率高得多。
+    /// ## 为什么拆成两个 CommandEncoder？
+    ///
+    /// Compute pass 写入 storage texture，render pass 从中读取。
+    /// 这需要 GPU 上的 pipeline barrier 来完成存储写入→纹理读取的同步。
+    ///
+    /// 在同一个 encoder 内，Dawn 的 Vulkan 后端可能不会正确插入
+    /// `VkImageMemoryBarrier`，导致 render pass 读到未定义数据（黑屏）。
+    ///
+    /// 拆成两个 encoder 并分别 submit，利用队列提交之间的隐式屏障
+    /// 确保 compute 写入在 render 读取之前完全可见。这在所有后端
+    /// （Vulkan、OpenGL、Metal、D3D12）上行为一致。
     pub fn render(&self, time: f32) {
         // 更新 uniform buffer: 将新的时间和分辨率写入 GPU
         self.queue.write_buffer(
@@ -156,6 +165,36 @@ impl State {
             0,
             bytemuck::cast_slice(&[Params::new(time, self.width as f32, self.height as f32)]),
         );
+
+        // ═══════════════════════════════════════════════════════════
+        // 阶段 1: Compute Pass（独立 CommandEncoder）
+        // ═══════════════════════════════════════════════════════════
+        // workgroup 大小为 16x16，所以需要 ceil(width/16) x ceil(height/16) 个工作组
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Encoder"),
+                });
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.compute_pipeline);
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+                let wg_x = (self.width + 15) / 16;
+                let wg_y = (self.height + 15) / 16;
+                compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            // 提交 compute 工作，队列屏障保证 storage texture 写入完成
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 阶段 2: Render Pass（独立 CommandEncoder）
+        // ═══════════════════════════════════════════════════════════
+        // 使用全屏四边形（4 顶点的 triangle strip）进行纹理采样 blit
 
         // 从 swap chain 获取当前帧的 surface texture。
         // 可能的失败情况: 超时、遮挡（窗口被盖住）、surface 失效等。
@@ -175,53 +214,37 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // CommandEncoder 录制 GPU 命令序列，类似"录像机"
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Command Encoder"),
-            });
-
-        // Compute Pass: 运行 compute shader 生成图像
-        // workgroup 大小为 16x16，所以需要 ceil(width/16) x ceil(height/16) 个工作组
         {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-            let wg_x = (self.width + 15) / 16;
-            let wg_y = (self.height + 15) / 16;
-            compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Render Encoder"),
+                });
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &self.render_bind_group, &[]);
+                render_pass.draw(0..4, 0..1); // 4 个顶点 = 一个全屏四边形
+            }
+            // 提交 render 工作
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Render Pass: 将 compute 输出的纹理绘制到屏幕
-        // 使用全屏四边形（4 顶点的 triangle strip）进行纹理采样 blit
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.render_bind_group, &[]);
-            render_pass.draw(0..4, 0..1); // 4 个顶点 = 一个全屏四边形
-        }
-
-        // 提交所有录制的命令到 GPU 队列执行，然后将结果呈现到屏幕
-        self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
     }
 }

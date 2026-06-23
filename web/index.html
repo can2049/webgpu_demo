@@ -111,8 +111,17 @@
             }
             console.log('WebGPU adapter:', adapter.info);
 
-            const wasm = await import('./pkg/webgpu_demo.js');
-            await wasm.default();
+            // Step 1: Load the WASM module
+            const wasmModule = await import('./pkg/webgpu_demo.js');
+
+            // Step 2: Initialize WASM (instantiates the module, sets up async runtime)
+            await wasmModule.default();
+
+            // Step 3: Call the Rust start() function.
+            // This was previously #[wasm_bindgen(start)] (auto-called during init,
+            // but the generated JS dropped the Promise). Now we manually await it
+            // so errors from WebGPU init propagate to the catch block below.
+            await wasmModule.start();
         }
 
         main().catch(e => {

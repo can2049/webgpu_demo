@@ -32,7 +32,10 @@ use wasm_bindgen::prelude::*;
 //  WASM 入口和浏览器事件集成
 // ─────────────────────────────────────────────
 
-/// WASM 模块的入口函数，浏览器加载 WASM 后自动调用。
+/// WASM 模块的主入口函数，由 JavaScript 端显式调用并 await。
+///
+/// 使用 `#[wasm_bindgen]` 而非 `#[wasm_bindgen(start)]` 是为了让 JS 端能
+/// 正确 await 此异步函数的 Promise，避免错误被静默吞掉。
 ///
 /// 完成以下工作:
 /// 1. 设置 panic hook（让 Rust panic 信息显示在浏览器控制台）
@@ -42,7 +45,7 @@ use wasm_bindgen::prelude::*;
 /// 5. 注册 window resize 事件监听
 /// 6. 启动 `requestAnimationFrame` 动画循环
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(start)]
+#[wasm_bindgen]
 pub async fn start() {
     // console_error_panic_hook 将 Rust panic 转发到浏览器控制台，
     // 默认情况下 WASM 中的 panic 只会显示 "unreachable" 错误。
