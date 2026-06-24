@@ -7,6 +7,21 @@
 
 同时展示了 **Compute Shader（通用计算）** 和 **Render Pipeline（渲染管线）** 两种 GPU 能力。
 
+### 两条路径对比
+
+| | Native 桌面 | WASM 浏览器 |
+|---|---|---|
+| **启动命令** | `cargo run` | `./build.sh` + 浏览器打开 |
+| **入口文件** | `src/main.rs` | `src/lib.rs` |
+| **窗口系统** | winit (OS 原生窗口) | HTML Canvas |
+| **GPU 后端** | Vulkan / Metal / DX12 | WebGPU 浏览器 API |
+| **事件循环** | winit `EventLoop` | `requestAnimationFrame` |
+| **调试方式** | GDB/LLDB, `RUST_LOG`, 终端日志 | 浏览器 DevTools |
+| **修改 shader 后** | `cargo run` 即可 | 需重新 `./build.sh` + 刷新浏览器 |
+| **额外依赖** | 无 | wasm-pack + WebGPU 浏览器 |
+
+两条路径共享全部渲染逻辑（`state.rs`、`pipeline.rs`、`texture.rs`、`params.rs`、两个 `.wgsl` shader），渲染效果完全一致。平台差异仅在 `gpu.rs` 的初始化层处理。
+
 ## 效果说明
 
 - **Compute Shader** 在 GPU 上并行计算每个像素的颜色（基于分形色彩算法），输出到一张 storage texture
@@ -135,18 +150,55 @@ webgpu_demo/
 ├── Cargo.toml              # Rust 依赖配置
 ├── build.sh                # WASM 构建脚本
 ├── src/
-│   ├── main.rs             # Native 桌面入口 (winit 事件循环)
-│   ├── lib.rs              # WASM 浏览器入口 (requestAnimationFrame)
-│   ├── gpu.rs              # WebGPU 设备初始化 (平台适配层)
-│   ├── params.rs           # Uniform 参数结构定义 (时间、分辨率)
-│   ├── pipeline.rs         # Compute/Render Pipeline 创建和配置
-│   ├── texture.rs          # 纹理、Bind Group、Sampler 管理
-│   ├── state.rs            # 应用状态: 平台无关的渲染逻辑
-│   ├── compute.wgsl        # Compute shader: GPU 并行生成分形图像
-│   └── render.wgsl         # Render shader: 全屏纹理采样 blit
+│   ├── main.rs             # [Native 独占] 桌面入口 (winit 事件循环)
+│   ├── lib.rs              # [WASM 独占]   浏览器入口 (requestAnimationFrame)
+│   ├── gpu.rs              # [平台适配层]   GPU 初始化，含 native/wasm 两条路径
+│   ├── params.rs           # [共享] Uniform 参数结构定义 (时间、分辨率)
+│   ├── pipeline.rs         # [共享] Compute/Render Pipeline 创建和配置
+│   ├── texture.rs          # [共享] 纹理、Bind Group、Sampler 管理
+│   ├── state.rs            # [共享] 应用状态: 平台无关的渲染逻辑
+│   ├── compute.wgsl        # [共享] Compute shader: GPU 并行生成分形图像
+│   └── render.wgsl         # [共享] Render shader: 全屏纹理采样 blit
 └── web/
-    ├── index.html           # 浏览器入口 HTML
+    ├── index.html           # [WASM 独占] 浏览器入口 HTML
     └── pkg/                 # wasm-pack 构建输出 (git ignored)
+```
+
+### 代码隔离关系
+
+```
+           ┌──────────────────┐         ┌──────────────────┐
+           │  Native 独占代码   │         │   WASM 独占代码    │
+           │                  │         │                  │
+           │  main.rs         │         │  lib.rs          │
+           │  (winit 窗口/    │         │  (Canvas/        │
+           │   事件循环)       │         │   AnimationFrame) │
+           └────────┬─────────┘         └────────┬─────────┘
+                    │                            │
+                    ▼                            ▼
+           ┌────────────────┐          ┌──────────────────┐
+           │ gpu.rs          │          │ gpu.rs            │
+           │ init_gpu_native │          │ init_gpu_wasm     │
+           │ #[cfg(native)]  │          │ #[cfg(wasm32)]    │
+           └────────┬────────┘          └────────┬─────────┘
+                    │                            │
+                    └────────────┬───────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │ gpu.rs: init_gpu_common │
+                    │ (平台无关的 GPU 初始化)  │
+                    └────────────┬───────────┘
+                                 ▼
+              ┌──────────────────────────────────┐
+              │        完全共享的渲染代码           │
+              │                                  │
+              │  state.rs    — 渲染状态与帧循环    │
+              │  pipeline.rs — GPU 管线创建        │
+              │  texture.rs  — 纹理/BindGroup     │
+              │  params.rs   — Uniform 参数        │
+              │  compute.wgsl — Compute Shader    │
+              │  render.wgsl  — Render Shader     │
+              └──────────────────────────────────┘
 ```
 
 ## 架构
@@ -194,6 +246,19 @@ webgpu_demo/
 
 ## 常见问题
 
+### Native 桌面
+
+**Q: `cargo run` 报 "Failed to find adapter"**
+A: 系统没有可用的 GPU 或驱动未正确安装。Linux 上确认已安装 Vulkan 驱动：`vulkaninfo | head` 应有输出。NVIDIA 用户安装 `nvidia-driver-xxx`，AMD 用户安装 `mesa-vulkan-drivers`。
+
+**Q: `cargo run` 窗口弹出但黑屏**
+A: 运行 `RUST_LOG=warn cargo run` 查看 wgpu 验证层日志。常见原因是 GPU 不支持 storage texture 的 `Rgba8Unorm` 格式（老旧集成显卡可能不支持）。
+
+**Q: Native 和 WASM 渲染效果不一致**
+A: 两个路径使用完全相同的 shader 和渲染逻辑。如果颜色略有差异，通常是 surface 格式不同导致的 gamma 校正差异（Native 可能选到非 sRGB 格式）。功能上没有区别。
+
+### WASM 浏览器
+
 **Q: 页面显示 "Insecure Context"**
 A: 你没有通过 `localhost` 访问。WebGPU 只在安全上下文中可用，`http://127.0.0.1` 和 `http://<IP>` 都不算。请使用 `http://localhost:8080`。
 
@@ -207,4 +272,4 @@ A: `navigator.gpu` 存在但 `requestAdapter()` 返回了 `null`，通常是 Lin
 A: 检查 canvas 尺寸是否为 0。在 DevTools Console 执行 `document.getElementById('webgpu-canvas').width` 确认。
 
 **Q: 修改 shader 后没有变化**
-A: 确保重新执行 `./build.sh`，浏览器硬刷新 (Ctrl+Shift+R) 清除缓存。
+A: 确保重新执行 `./build.sh`，浏览器硬刷新 (Ctrl+Shift+R) 清除缓存。Native 模式下 `cargo run` 会自动重新编译，无需额外操作。
