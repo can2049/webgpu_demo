@@ -6,15 +6,23 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# native 可执行文件入口，通过 `cargo run` 启动桌面窗口
+[[bin]]
+name = "webgpu_demo"
+path = "src/main.rs"
+
 [dependencies]
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 
+# ─── Native 桌面平台依赖 ───
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.4"
 env_logger = "0.11"
+winit = "0.30"
 
+# ─── WASM 浏览器平台依赖 ───
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl"] }
 console_error_panic_hook = "0.1"

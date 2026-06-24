@@ -5,16 +5,20 @@
 //! - 组装初始化阶段创建的各个 GPU 资源
 //! - 处理窗口 resize 时的资源重建
 //! - 每帧执行 compute + render 的渲染流程
+//!
+//! `State` 本身是平台无关的——它只依赖 wgpu 对象，不依赖 winit 或 web_sys。
+//! 平台差异在 `gpu.rs` 的初始化函数中处理，结果通过 `GpuContext` 传入。
 
-use crate::gpu;
+use crate::gpu::GpuContext;
 use crate::params::{self, Params};
 use crate::pipeline;
 use crate::texture;
 
-/// 渲染应用的完整状态。
+/// 渲染应用的完整状态（平台无关）。
 ///
 /// 所有 GPU 资源的生命周期都与 `State` 绑定。
-/// 在 WASM 中通过 `Rc<RefCell<State>>` 共享，因为 JavaScript 回调需要多处访问。
+/// - Native: 由 `App` (ApplicationHandler) 持有
+/// - WASM: 通过 `Rc<RefCell<State>>` 在 JS 回调间共享
 pub struct State {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -35,12 +39,13 @@ pub struct State {
 }
 
 impl State {
-    /// 创建并初始化完整的渲染状态。
+    /// 从已初始化的 GPU 上下文创建渲染状态。
     ///
-    /// 初始化顺序很重要，因为后续步骤依赖前面创建的资源:
+    /// `GpuContext` 封装了平台相关的初始化结果（device, queue, surface），
+    /// 此函数在此基础上创建平台无关的渲染资源:
     ///
     /// ```text
-    /// GPU Context (device, queue, surface)
+    /// GpuContext (来自 gpu.rs，平台相关)
     ///     ↓
     /// Pipelines (compute + render)
     ///     ↓
@@ -48,16 +53,14 @@ impl State {
     ///     ↓
     /// Texture + Bind Groups
     /// ```
-    pub async fn new(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Self {
-        // 步骤 1: 初始化 GPU 设备和 surface
-        let gpu::GpuContext {
+    pub fn new(ctx: GpuContext, width: u32, height: u32) -> Self {
+        let GpuContext {
             device,
             queue,
             surface,
             surface_config,
-        } = gpu::init_gpu(canvas, width, height).await;
+        } = ctx;
 
-        // 步骤 2: 创建渲染管线
         let pipeline::ComputeResources {
             pipeline: compute_pipeline,
             bind_group_layout: compute_bind_group_layout,
@@ -68,11 +71,9 @@ impl State {
             bind_group_layout: render_bind_group_layout,
         } = pipeline::create_render_pipeline(&device, surface_config.format);
 
-        // 步骤 3: 创建 uniform buffer 和纹理采样器
         let params_buffer = params::create_params_buffer(&device, width, height);
         let sampler = texture::create_sampler(&device);
 
-        // 步骤 4: 创建纹理和 bind groups
         let (storage_texture, compute_bind_group, render_bind_group) =
             texture::create_texture_and_bind_groups(
                 &device,
@@ -103,9 +104,9 @@ impl State {
         }
     }
 
-    /// 处理画布尺寸变化。
+    /// 处理窗口/画布尺寸变化。
     ///
-    /// 当浏览器窗口 resize 时需要:
+    /// 当窗口 resize 时需要:
     /// 1. 更新 surface 配置（告诉 GPU 新的输出尺寸）
     /// 2. 重建 storage texture（因为旧纹理尺寸不匹配）
     /// 3. 重建 bind groups（因为它们引用了旧的 texture view）
@@ -150,26 +151,16 @@ impl State {
     /// ## 为什么拆成两个 CommandEncoder？
     ///
     /// Compute pass 写入 storage texture，render pass 从中读取。
-    /// 这需要 GPU 上的 pipeline barrier 来完成存储写入→纹理读取的同步。
-    ///
-    /// 在同一个 encoder 内，Dawn 的 Vulkan 后端可能不会正确插入
-    /// `VkImageMemoryBarrier`，导致 render pass 读到未定义数据（黑屏）。
-    ///
     /// 拆成两个 encoder 并分别 submit，利用队列提交之间的隐式屏障
-    /// 确保 compute 写入在 render 读取之前完全可见。这在所有后端
-    /// （Vulkan、OpenGL、Metal、D3D12）上行为一致。
+    /// 确保 compute 写入在 render 读取之前完全可见。
     pub fn render(&self, time: f32) {
-        // 更新 uniform buffer: 将新的时间和分辨率写入 GPU
         self.queue.write_buffer(
             &self.params_buffer,
             0,
             bytemuck::cast_slice(&[Params::new(time, self.width as f32, self.height as f32)]),
         );
 
-        // ═══════════════════════════════════════════════════════════
-        // 阶段 1: Compute Pass（独立 CommandEncoder）
-        // ═══════════════════════════════════════════════════════════
-        // workgroup 大小为 16x16，所以需要 ceil(width/16) x ceil(height/16) 个工作组
+        // ═══ 阶段 1: Compute Pass ═══
         {
             let mut encoder = self
                 .device
@@ -187,17 +178,10 @@ impl State {
                 let wg_y = (self.height + 15) / 16;
                 compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
-            // 提交 compute 工作，队列屏障保证 storage texture 写入完成
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // 阶段 2: Render Pass（独立 CommandEncoder）
-        // ═══════════════════════════════════════════════════════════
-        // 使用全屏四边形（4 顶点的 triangle strip）进行纹理采样 blit
-
-        // 从 swap chain 获取当前帧的 surface texture。
-        // 可能的失败情况: 超时、遮挡（窗口被盖住）、surface 失效等。
+        // ═══ 阶段 2: Render Pass ═══
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
@@ -239,9 +223,8 @@ impl State {
                 });
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &self.render_bind_group, &[]);
-                render_pass.draw(0..4, 0..1); // 4 个顶点 = 一个全屏四边形
+                render_pass.draw(0..4, 0..1);
             }
-            // 提交 render 工作
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 

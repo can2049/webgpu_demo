@@ -1,6 +1,11 @@
-# WebGPU Demo — Rust + WASM
+# WebGPU Demo — Rust + WASM / Native
 
-使用 Rust 编写、编译为 WASM 运行在浏览器中的 WebGPU 演示。同时展示了 **Compute Shader（通用计算）** 和 **Render Pipeline（渲染管线）** 两种 GPU 能力。
+使用 Rust 编写的 WebGPU 演示，支持**两种运行方式**：
+
+- **浏览器 (WASM)**: 编译为 WebAssembly，通过 WebGPU API 运行
+- **桌面 (Native)**: 直接 `cargo run`，使用 Vulkan / Metal / DX12 后端，无需浏览器
+
+同时展示了 **Compute Shader（通用计算）** 和 **Render Pipeline（渲染管线）** 两种 GPU 能力。
 
 ## 效果说明
 
@@ -10,31 +15,38 @@
 
 ## 前置条件
 
-| 工具 | 最低版本 | 安装方式 |
-|------|---------|---------|
-| Rust | 1.85+ | [rustup.rs](https://rustup.rs/) |
-| wasm-pack | 0.13+ | `cargo install wasm-pack` |
-| 支持 WebGPU 的浏览器 | Chrome 113+ / Edge 113+ / Firefox Nightly | — |
+| 工具 | 最低版本 | 安装方式 | 用途 |
+|------|---------|---------|------|
+| Rust | 1.85+ | [rustup.rs](https://rustup.rs/) | Native + WASM |
+| wasm-pack | 0.13+ | `cargo install wasm-pack` | 仅 WASM |
+| 支持 WebGPU 的浏览器 | Chrome 113+ / Edge 113+ / Firefox Nightly | — | 仅 WASM |
 
-> 确认已安装 wasm32 target: `rustup target add wasm32-unknown-unknown`
+> WASM 构建还需安装 wasm32 target: `rustup target add wasm32-unknown-unknown`
 
-## 构建
+## 运行方式一：桌面 Native（推荐调试用）
+
+无需浏览器，直接在桌面窗口中运行。使用操作系统原生的 GPU 后端（Linux: Vulkan, macOS: Metal, Windows: DX12）。
 
 ```bash
-# 一键构建
-./build.sh
+# 直接运行（debug 模式，编译快，便于调试）
+cargo run
 
-# 或手动执行
-wasm-pack build --target web --out-dir web/pkg
+# 带日志输出
+RUST_LOG=info cargo run
+
+# release 模式（性能更好）
+cargo run --release
 ```
 
-构建产物在 `web/pkg/` 目录下。
+启动后会弹出一个 800×600 的桌面窗口，显示与浏览器版本相同的分形动画效果。支持窗口缩放。
 
-## 运行
-
-构建完成后，需要通过 HTTP 服务器访问（WASM 模块不能通过 `file://` 协议加载）：
+## 运行方式二：浏览器 WASM
 
 ```bash
+# 构建 WASM
+./build.sh
+
+# 启动本地 HTTP 服务器
 cd web
 python3 -m http.server 8080 --bind localhost
 ```
@@ -66,6 +78,23 @@ google-chrome --enable-unsafe-webgpu http://localhost:8080
 > **实测环境：** Ubuntu 20.04 + NVIDIA RTX 3060 + 驱动 550 + Chrome 148，Vulkan loader 版本 1.2.131。在此环境下必须启用 `enable-unsafe-webgpu` 才能获取到 GPU adapter。
 
 ## 调试
+
+### 0. Native 桌面调试（推荐）
+
+Native 模式下可以直接使用 Rust 生态的调试工具，无需浏览器：
+
+```bash
+# 带日志运行
+RUST_LOG=info cargo run
+
+# 使用 GDB/LLDB 调试
+cargo build && gdb target/debug/webgpu_demo
+
+# wgpu 验证层详细日志
+RUST_LOG=wgpu=warn cargo run
+```
+
+修改 shader 后只需 `cargo run` 即可看到效果（无需 wasm-pack 构建 + 浏览器刷新）。
 
 ### 1. 浏览器 DevTools 控制台
 
@@ -104,27 +133,43 @@ Chrome DevTools → Sources → 可以看到 Rust 源文件并设置断点。需
 ```
 webgpu_demo/
 ├── Cargo.toml              # Rust 依赖配置
-├── build.sh                # 构建脚本
+├── build.sh                # WASM 构建脚本
 ├── src/
-│   ├── lib.rs              # WASM 入口、模块声明、浏览器事件集成
-│   ├── gpu.rs              # WebGPU 设备初始化 (Instance → Adapter → Device)
+│   ├── main.rs             # Native 桌面入口 (winit 事件循环)
+│   ├── lib.rs              # WASM 浏览器入口 (requestAnimationFrame)
+│   ├── gpu.rs              # WebGPU 设备初始化 (平台适配层)
 │   ├── params.rs           # Uniform 参数结构定义 (时间、分辨率)
 │   ├── pipeline.rs         # Compute/Render Pipeline 创建和配置
 │   ├── texture.rs          # 纹理、Bind Group、Sampler 管理
-│   ├── state.rs            # 应用状态: 组装上述模块，resize/render 逻辑
+│   ├── state.rs            # 应用状态: 平台无关的渲染逻辑
 │   ├── compute.wgsl        # Compute shader: GPU 并行生成分形图像
 │   └── render.wgsl         # Render shader: 全屏纹理采样 blit
 └── web/
-    ├── index.html           # 入口 HTML
+    ├── index.html           # 浏览器入口 HTML
     └── pkg/                 # wasm-pack 构建输出 (git ignored)
 ```
 
 ## 架构
 
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                    平台适配层 (gpu.rs)                        │
+│                                                             │
+│  Native (main.rs)              WASM (lib.rs)                │
+│  ┌───────────────┐             ┌────────────────────┐       │
+│  │ winit Window   │             │ HTML Canvas         │       │
+│  │ Vulkan/Metal   │             │ WebGPU API          │       │
+│  │ /DX12          │             │ requestAnimFrame    │       │
+│  └───────┬───────┘             └─────────┬──────────┘       │
+│          └──────────┬────────────────────┘                  │
+│                     ▼                                       │
+│              GpuContext (device, queue, surface)             │
+└─────────────────────┬───────────────────────────────────────┘
+                      ▼
 ┌─────────────────────────────────────────────────┐
-│  每一帧 (requestAnimationFrame)                  │
+│        平台无关渲染逻辑 (state.rs)                │
 │                                                  │
+│  每一帧:                                          │
 │  1. 更新 uniform buffer (时间、分辨率)             │
 │                                                  │
 │  2. Compute Pass                                 │

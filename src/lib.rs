@@ -1,29 +1,26 @@
-//! # WebGPU Demo — Rust + WASM
+//! # WebGPU Demo — Rust + WASM / Native
 //!
-//! 一个使用 Rust 编写、编译为 WebAssembly 运行在浏览器中的 WebGPU 渲染演示。
+//! 使用 Rust 编写的 WebGPU 渲染演示，支持两种运行方式:
+//! - **浏览器 (WASM)**: 编译为 WebAssembly，通过 `wasm-pack` 构建，运行在浏览器中
+//! - **桌面 (Native)**: 直接 `cargo run`，使用 winit 窗口 + Vulkan/Metal/DX12 后端
 //!
 //! ## 模块结构
 //!
 //! ```text
-//! lib.rs          ← WASM 入口和动画循环（本文件）
-//! ├── gpu.rs      ← WebGPU 设备初始化
+//! lib.rs          ← WASM 入口（本文件）
+//! main.rs         ← Native 桌面入口（winit 事件循环）
+//! ├── gpu.rs      ← WebGPU 设备初始化（平台适配层）
 //! ├── params.rs   ← Uniform 参数定义
 //! ├── pipeline.rs ← Compute/Render 管线创建
 //! ├── texture.rs  ← 纹理和 bind group 管理
-//! └── state.rs    ← 应用状态（组装上述模块）
+//! └── state.rs    ← 应用状态（平台无关，组装上述模块）
 //! ```
-//!
-//! ## 渲染架构
-//!
-//! 每帧执行两个 GPU pass:
-//! 1. **Compute Pass** — 运行 `compute.wgsl`，在 GPU 上并行计算每个像素的颜色
-//! 2. **Render Pass** — 运行 `render.wgsl`，将计算结果绘制到屏幕
 
-mod gpu;
-mod params;
-mod pipeline;
-mod state;
-mod texture;
+pub mod gpu;
+pub mod params;
+pub mod pipeline;
+pub mod state;
+pub mod texture;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -33,9 +30,6 @@ use wasm_bindgen::prelude::*;
 // ─────────────────────────────────────────────
 
 /// WASM 模块的主入口函数，由 JavaScript 端显式调用并 await。
-///
-/// 使用 `#[wasm_bindgen]` 而非 `#[wasm_bindgen(start)]` 是为了让 JS 端能
-/// 正确 await 此异步函数的 Promise，避免错误被静默吞掉。
 ///
 /// 完成以下工作:
 /// 1. 设置 panic hook（让 Rust panic 信息显示在浏览器控制台）
@@ -47,12 +41,9 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn start() {
-    // console_error_panic_hook 将 Rust panic 转发到浏览器控制台，
-    // 默认情况下 WASM 中的 panic 只会显示 "unreachable" 错误。
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     console_log::init_with_level(log::Level::Info).expect("Failed to init logger");
 
-    // 从 DOM 获取 canvas 元素，所有 WebGPU 渲染都输出到这个 canvas
     let window = web_sys::window().expect("No window");
     let document = window.document().expect("No document");
     let canvas = document
@@ -61,15 +52,16 @@ pub async fn start() {
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .expect("Element is not a canvas");
 
-    // 设置 canvas 像素尺寸与 CSS 布局尺寸一致，避免模糊
     let width = canvas.client_width() as u32;
     let height = canvas.client_height() as u32;
     canvas.set_width(width);
     canvas.set_height(height);
 
-    let state = state::State::new(canvas.clone(), width, height).await;
+    // WASM 路径: Canvas → GpuContext → State
+    let ctx = gpu::init_gpu_wasm(canvas.clone(), width, height).await;
+    let state = state::State::new(ctx, width, height);
 
-    // 使用 Rc<RefCell<>> 共享 state，因为多个 JS 回调（resize、animation）都需要访问它。
+    // 使用 Rc<RefCell<>> 共享 state，因为多个 JS 回调都需要访问它。
     // WASM 是单线程的，所以 Rc 就够了，不需要 Arc。
     let state = std::rc::Rc::new(std::cell::RefCell::new(state));
 
@@ -78,9 +70,6 @@ pub async fn start() {
 }
 
 /// 注册浏览器窗口 resize 事件监听器。
-///
-/// 当用户调整浏览器窗口大小时，同步更新 canvas 像素尺寸并重建 GPU 资源。
-/// `closure.forget()` 让闭包的生命周期跟随整个页面，不会被 Rust 的 drop 回收。
 #[cfg(target_arch = "wasm32")]
 fn setup_resize_handler(
     window: &web_sys::Window,
@@ -106,13 +95,7 @@ fn setup_resize_handler(
 
 /// 启动 `requestAnimationFrame` 驱动的渲染循环。
 ///
-/// 浏览器每帧（通常 60fps）回调一次，传入高精度时间戳。
-///
-/// ## 实现细节
-///
 /// 使用 `Rc<RefCell<Option<Closure>>>` 模式让闭包可以递归地注册下一帧回调。
-/// 这是 Rust WASM 中实现 requestAnimationFrame 循环的标准做法，
-/// 因为闭包需要引用自身来注册下一帧。
 #[cfg(target_arch = "wasm32")]
 fn start_animation_loop(state: &std::rc::Rc<std::cell::RefCell<state::State>>) {
     let f: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn FnMut(f64)>>>> =
@@ -120,18 +103,15 @@ fn start_animation_loop(state: &std::rc::Rc<std::cell::RefCell<state::State>>) {
     let g = f.clone();
     let state = state.clone();
 
-    // `f` 持有闭包本身，闭包内部通过 `f` 引用自己来注册下一帧
     *g.borrow_mut() = Some(Closure::new(move |timestamp: f64| {
         let time_sec = (timestamp / 1000.0) as f32;
         state.borrow().render(time_sec);
         request_animation_frame(f.borrow().as_ref().unwrap());
     }));
 
-    // 触发第一帧
     request_animation_frame(g.borrow().as_ref().unwrap());
 }
 
-/// 调用浏览器的 `window.requestAnimationFrame()` API。
 #[cfg(target_arch = "wasm32")]
 fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
     web_sys::window()
