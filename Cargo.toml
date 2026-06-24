@@ -18,6 +18,8 @@ bytemuck = { version = "1", features = ["derive"] }
 
 # ─── Native 桌面平台依赖 ───
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# 为 native 启用系统 GPU 后端: Linux=Vulkan, macOS=Metal, Windows=DX12
+wgpu = { version = "29", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl"] }
 pollster = "0.4"
 env_logger = "0.11"
 winit = "0.30"
