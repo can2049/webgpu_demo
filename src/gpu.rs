@@ -104,13 +104,25 @@ async fn init_gpu_common(
 
     // Device 是逻辑设备，是我们提交 GPU 命令的接口。
     // Queue 用于提交命令缓冲区和写入 buffer 数据。
-    // `downlevel_webgl2_defaults()` 使用较保守的 limits，确保在大多数实现上兼容。
+    //
+    // Limits 的选择因平台而异:
+    // - Native: 使用 `default()` limits，包含 storage texture 等现代 GPU 特性
+    // - WASM:   使用 `downlevel_webgl2_defaults()`，保守兼容浏览器实现
+    //
+    // 注意: `downlevel_webgl2_defaults()` 将 `max_storage_textures_per_shader_stage`
+    // 设为 0（WebGL2 不支持 storage texture），而本项目的 compute shader 需要写入
+    // storage texture，所以 Native 不能使用这个保守的 limits。
+    let base_limits = if cfg!(target_arch = "wasm32") {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    } else {
+        wgpu::Limits::default()
+    };
+
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("Device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits: base_limits.using_resolution(adapter.limits()),
             ..Default::default()
         })
         .await
