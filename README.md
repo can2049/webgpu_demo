@@ -55,6 +55,8 @@ cargo run --release
 
 启动后会弹出一个 800×600 的桌面窗口，显示与浏览器版本相同的分形动画效果。支持窗口缩放。
 
+> **实测环境：** Ubuntu 20.04 + NVIDIA RTX 3060 + 驱动 550 + Vulkan loader 1.2.131，`cargo run` 正常运行。
+
 ## 运行方式二：浏览器 WASM
 
 ```bash
@@ -248,8 +250,14 @@ webgpu_demo/
 
 ### Native 桌面
 
+**Q: `cargo run` 报 "No wgpu backend feature"**
+A: wgpu 没有启用 GPU 后端。确认 `Cargo.toml` 中 native target 的 wgpu 依赖包含 `vulkan`（Linux）、`metal`（macOS）或 `dx12`（Windows）feature。
+
 **Q: `cargo run` 报 "Failed to find adapter"**
 A: 系统没有可用的 GPU 或驱动未正确安装。Linux 上确认已安装 Vulkan 驱动：`vulkaninfo | head` 应有输出。NVIDIA 用户安装 `nvidia-driver-xxx`，AMD 用户安装 `mesa-vulkan-drivers`。
+
+**Q: `cargo run` 报 "Too many bindings of type StorageTextures, limit is 0"**
+A: Device limits 过于保守。本项目的 compute shader 需要 storage texture，不能使用 `downlevel_webgl2_defaults()`（它将 storage texture 数量设为 0）。Native 平台应使用 `Limits::default()`。
 
 **Q: `cargo run` 窗口弹出但黑屏**
 A: 运行 `RUST_LOG=warn cargo run` 查看 wgpu 验证层日志。常见原因是 GPU 不支持 storage texture 的 `Rgba8Unorm` 格式（老旧集成显卡可能不支持）。
