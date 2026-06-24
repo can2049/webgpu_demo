@@ -31,11 +31,7 @@ pub struct GpuContext {
 /// ## Panics
 /// - 找不到支持 WebGPU 的 GPU adapter 时
 /// - 无法创建逻辑设备时
-pub async fn init_gpu(
-    canvas: web_sys::HtmlCanvasElement,
-    width: u32,
-    height: u32,
-) -> GpuContext {
+pub async fn init_gpu(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> GpuContext {
     // wgpu::Instance 是与 GPU 系统通信的入口。
     // `BROWSER_WEBGPU` 表示使用浏览器原生的 WebGPU API（而非 WebGL 回退）。
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
